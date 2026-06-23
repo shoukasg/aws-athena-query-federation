@@ -114,12 +114,43 @@ public class DocDBRecordHandler
      */
     private MongoClient getOrCreateConn(Split split)
     {
-        String connStr = split.getProperty(DOCDB_CONN_STR);
-        if (connStr == null) {
-            throw new RuntimeException(DOCDB_CONN_STR + " Split property is null! Unable to create connection.");
+        String authMode = System.getenv().getOrDefault("AUTH_MODE", "SCRAM"); // IAM or SCRAM
+
+        if ("IAM".equalsIgnoreCase(authMode)) {
+            // IAM auth (MONGODB-AWS) — no credentials from Secrets Manager
+            String host = System.getenv().getOrDefault("DOCDB_HOST", "");
+            String port = System.getenv().getOrDefault("DOCDB_PORT", "27017");
+
+            if (host.isEmpty()) {
+                String connStr = split.getProperty(DOCDB_CONN_STR);
+                if (connStr != null && connStr.contains("@")) {
+                    String afterAt = connStr.substring(connStr.indexOf("@") + 1);
+                    String hostPort = afterAt.split("/")[0].split("\\?")[0];
+                    String[] parts = hostPort.split(":");
+                    host = parts[0];
+                    if (parts.length > 1) port = parts[1];
+                } else if (connStr != null && connStr.startsWith("mongodb://")) {
+                    String afterScheme = connStr.substring("mongodb://".length());
+                    String hostPort = afterScheme.split("/")[0].split("\\?")[0];
+                    String[] parts = hostPort.split(":");
+                    host = parts[0];
+                    if (parts.length > 1) port = parts[1];
+                }
+            }
+
+            String iamConnStr = "mongodb://" + host + ":" + port + "/"
+                + "?authSource=%24external&authMechanism=MONGODB-AWS&directConnection=true";
+            logger.info("getOrCreateConn (RecordHandler): Using MONGODB-AWS (IAM) auth to {}:{}", host, port);
+            return connectionFactory.getOrCreateConn(iamConnStr);
+        } else {
+            // Default: SCRAM auth — original behavior
+            String connStr = split.getProperty(DOCDB_CONN_STR);
+            if (connStr == null) {
+                throw new RuntimeException(DOCDB_CONN_STR + " Split property is null! Unable to create connection.");
+            }
+            String endpoint = resolveWithDefaultCredentials(connStr);
+            return connectionFactory.getOrCreateConn(endpoint);
         }
-        String endpoint = resolveWithDefaultCredentials(connStr);
-        return connectionFactory.getOrCreateConn(endpoint);
     }
 
     private static Map<String, Object> documentAsMap(Document document, boolean caseInsensitive)

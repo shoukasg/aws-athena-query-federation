@@ -150,9 +150,39 @@ public class DocDBMetadataHandler
 
     private MongoClient getOrCreateConn(MetadataRequest request)
     {
-        String connStr = getConnStr(request);
-        String endpoint = resolveWithDefaultCredentials(connStr);
-        return connectionFactory.getOrCreateConn(endpoint);
+        String authMode = System.getenv().getOrDefault("AUTH_MODE", "SCRAM"); // IAM or SCRAM
+
+        if ("IAM".equalsIgnoreCase(authMode)) {
+            // IAM auth (MONGODB-AWS) — no credentials from Secrets Manager
+            String host = System.getenv().getOrDefault("DOCDB_HOST", "");
+            String port = System.getenv().getOrDefault("DOCDB_PORT", "27017");
+
+            if (host.isEmpty()) {
+                try {
+                    Map<String, String> configOpts = request.getIdentity() != null
+                        ? request.getIdentity().getConfigOptions() : java.util.Collections.emptyMap();
+                    host = configOpts.getOrDefault("HOST", configOpts.getOrDefault("host", ""));
+                    port = configOpts.getOrDefault("PORT", configOpts.getOrDefault("port", "27017"));
+                } catch (Exception e) {
+                    logger.warn("Could not get host from federated identity, falling back to configOptions");
+                }
+            }
+
+            if (host.isEmpty()) {
+                host = configOptions.getOrDefault("HOST", configOptions.getOrDefault("host", ""));
+                port = configOptions.getOrDefault("PORT", configOptions.getOrDefault("port", "27017"));
+            }
+
+            String iamConnStr = "mongodb://" + host + ":" + port + "/"
+                + "?authSource=%24external&authMechanism=MONGODB-AWS&directConnection=true";
+            logger.info("getOrCreateConn: Using MONGODB-AWS (IAM) auth to {}:{}", host, port);
+            return connectionFactory.getOrCreateConn(iamConnStr);
+        } else {
+            // Default: SCRAM auth — original behavior (reads credentials from Secrets Manager)
+            String connStr = getConnStr(request);
+            String endpoint = resolveWithDefaultCredentials(connStr);
+            return connectionFactory.getOrCreateConn(endpoint);
+        }
     }
 
     /**
@@ -434,60 +464,16 @@ public class DocDBMetadataHandler
     /**
      * Constructs a DocDB connection string from federated identity configuration options.
      * 
-     * <p>This method dynamically builds a MongoDB connection string by:
-     * <ul>
-     *   <li>Extracting host and port from the provided config options</li>
-     *   <li>Retrieving credentials from AWS Secrets Manager using the secret ARN</li>
-     *   <li>Parsing JSON credentials to extract username and password</li>
-     *   <li>Applying SSL enforcement and authentication database settings</li>
-     *   <li>Constructing the final MongoDB connection string with proper formatting</li>
-     * </ul>
-     * 
-     * <p>Expected JSON credential format from Secrets Manager:
-     * <pre>
-     * {
-     *   "username": "mongodbadmin",
-     *   "password": "secretpassword",
-     *   "engine": "mongo",
-     *   "host": "cluster.docdb.amazonaws.com",
-     *   "port": 27017
-     * }
-     * </pre>
+     * <p>MODIFIED: Uses MONGODB-AWS (IAM) authentication instead of SCRAM.
+     * The Lambda execution role authenticates directly to DocumentDB - no Secrets Manager needed at runtime.
+     * The secret_arn on the Glue connection is only used for Glue validation and is ignored here.
      * 
      * @param configOptions Map containing federated identity configuration including:
-     *                     HOST, PORT, secret_arn, JDBC_PARAMS, ENFORCE_SSL, AUTHENTICATION_DATABASE
-     * @return Fully constructed MongoDB connection string in format: mongodb://username:password@host:port/?jdbcParams
-     * @throws RuntimeException if JSON credential parsing fails or required parameters are missing
+     *                     HOST, PORT, JDBC_PARAMS, ENFORCE_SSL
+     * @return MongoDB connection string with authMechanism=MONGODB-AWS
      */
     private String getConnectionStringForFederatedRequests(Map<String, String> configOptions)
     {
-        String secretName = configOptions.get(SECRET_ARN_KEY);
-        if (Strings.isNullOrEmpty(secretName)) {
-            throw new IllegalArgumentException("Secret ARN is missing in the request");
-        }
-
-        final String credentials = getSecret(configOptions.get(SECRET_ARN_KEY), getRequestOverrideConfig(configOptions));
-        final String username;
-        final String password;
-        try {
-            ObjectMapper mapper = new ObjectMapper();
-            TreeMap<String, String> credMap = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-            credMap.putAll(mapper.readValue(credentials, new TypeReference<Map<String, String>>() {}));
-            username = credMap.get(USERNAME_FIELD);
-            password = credMap.get(PASSWORD_FIELD);
-        }
-        catch (Exception e) {
-            throw new RuntimeException("Invalid JSON credentials format, make sure username and " +
-                    "password are present in Secrets Manager", e);
-        }
-
-        if (Strings.isNullOrEmpty(username)) {
-            throw new IllegalArgumentException("Username is missing from the credentials in Secrets Manager");
-        }
-        if (Strings.isNullOrEmpty(password)) {
-            throw new IllegalArgumentException("Password is missing from the credentials in Secrets Manager");
-        }
-
         String host = configOptions.get(HOST);
         if (Strings.isNullOrEmpty(host)) {
             throw new IllegalArgumentException("HOST is missing from the configuration options");
@@ -498,21 +484,21 @@ public class DocDBMetadataHandler
         }
         String jdbcParams = configOptions.get(JDBC_PARAMS);
         String enforceSsl = configOptions.get(ENFORCE_SSL);
-        String authDb = configOptions.getOrDefault(AUTH_DB_KEY, "");
+
+        // Build IAM auth connection string
+        StringBuilder connStr = new StringBuilder();
+        connStr.append("mongodb://").append(host).append(":").append(port).append("/");
+        connStr.append("?authSource=%24external&authMechanism=MONGODB-AWS&directConnection=true");
 
         if (Boolean.parseBoolean(enforceSsl)) {
-            if (jdbcParams == null) {
-                jdbcParams = ENFORCE_SSL_JDBC_PARAM;
-            }
-            else if (!jdbcParams.contains(ENFORCE_SSL_JDBC_PARAM)) {
-                jdbcParams = ENFORCE_SSL_JDBC_PARAM + "&" + jdbcParams;
-            }
+            connStr.append("&ssl=true&ssl_ca_certs=rds-combined-ca-bundle.pem");
         }
 
-        String connStr = String.format(CONNECTION_STRING_TEMPLATE, username, password, host, port, authDb);
-        if (jdbcParams != null) {
-            connStr += "?" + jdbcParams;
+        if (!Strings.isNullOrEmpty(jdbcParams)) {
+            connStr.append("&").append(jdbcParams);
         }
-        return connStr;
+
+        logger.info("getConnectionStringForFederatedRequests: Using MONGODB-AWS (IAM) authentication");
+        return connStr.toString();
     }
 }
